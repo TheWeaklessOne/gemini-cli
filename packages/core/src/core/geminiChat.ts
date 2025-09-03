@@ -18,6 +18,7 @@ import type {
 import { toParts } from '../code_assist/converter.js';
 import { createUserContent } from '@google/genai';
 import { retryWithBackoff } from '../utils/retry.js';
+import { isFunctionResponse } from '../utils/messageInspectors.js';
 import type { ContentGenerator } from './contentGenerator.js';
 import { AuthType } from './contentGenerator.js';
 import type { Config } from '../config/config.js';
@@ -36,7 +37,6 @@ import {
   ContentRetryFailureEvent,
   InvalidChunkEvent,
 } from '../telemetry/types.js';
-import { isFunctionResponse } from '../utils/messageInspectors.js';
 import { partListUnionToString } from './geminiRequest.js';
 
 /**
@@ -53,7 +53,6 @@ const INVALID_CONTENT_RETRY_OPTIONS: ContentRetryOptions = {
   maxAttempts: 3, // 1 initial call + 2 retries
   initialDelayMs: 500,
 };
-
 /**
  * Returns true if the response is valid, false otherwise.
  */
@@ -76,7 +75,7 @@ function isValidContent(content: Content): boolean {
     if (part === undefined || Object.keys(part).length === 0) {
       return false;
     }
-    if (!part.thought && part.text !== undefined && part.text === '') {
+    if (part.text !== undefined && part.text === '') {
       return false;
     }
   }
@@ -234,7 +233,7 @@ export class GeminiChat {
    * ```ts
    * const chat = ai.chats.create({model: 'gemini-2.0-flash'});
    * const response = await chat.sendMessage({
-   * message: 'Why is the sky blue?'
+   *   message: 'Why is the sky blue?'
    * });
    * console.log(response.text);
    * ```
@@ -302,8 +301,6 @@ export class GeminiChat {
 
       this.sendPromise = (async () => {
         const outputContent = response.candidates?.[0]?.content;
-        const modelOutput = outputContent ? [outputContent] : [];
-
         // Because the AFC input contains the entire curated chat history in
         // addition to the new user input, we need to truncate the AFC history
         // to deduplicate the existing chat history.
@@ -315,18 +312,16 @@ export class GeminiChat {
           automaticFunctionCallingHistory =
             fullAutomaticFunctionCallingHistory.slice(index) ?? [];
         }
-
+        const modelOutput = outputContent ? [outputContent] : [];
         this.recordHistory(
           userContent,
           modelOutput,
           automaticFunctionCallingHistory,
         );
       })();
-      await this.sendPromise.catch((error) => {
+      await this.sendPromise.catch(() => {
         // Resets sendPromise to avoid subsequent calls failing
         this.sendPromise = Promise.resolve();
-        // Re-throw the error so the caller knows something went wrong.
-        throw error;
       });
       return response;
     } catch (error) {
@@ -350,10 +345,10 @@ export class GeminiChat {
    * ```ts
    * const chat = ai.chats.create({model: 'gemini-2.0-flash'});
    * const response = await chat.sendMessageStream({
-   * message: 'Why is the sky blue?'
+   *   message: 'Why is the sky blue?'
    * });
    * for await (const chunk of response) {
-   * console.log(chunk.text);
+   *   console.log(chunk.text);
    * }
    * ```
    */
@@ -384,9 +379,7 @@ export class GeminiChat {
       });
     }
 
-    // Add user content to history ONCE before any attempts.
-    this.history.push(userContent);
-    const requestContents = this.getHistory(true);
+    const requestContents = this.getHistory(true).concat(userContent);
 
     // eslint-disable-next-line @typescript-eslint/no-this-alias
     const self = this;
@@ -452,10 +445,6 @@ export class GeminiChat {
               ),
             );
           }
-          // If the stream fails, remove the user message that was added.
-          if (self.history[self.history.length - 1] === userContent) {
-            self.history.pop();
-          }
           throw lastError;
         }
       } finally {
@@ -519,7 +508,7 @@ export class GeminiChat {
    * - The `curated history` contains only the valid turns between user and
    * model, which will be included in the subsequent requests sent to the model.
    * - The `comprehensive history` contains all turns, including invalid or
-   * empty model outputs, providing a complete record of the history.
+   *   empty model outputs, providing a complete record of the history.
    *
    * The history is updated after receiving the response from the model,
    * for streaming response, it means receiving the last chunk of the response.
@@ -528,9 +517,9 @@ export class GeminiChat {
    * history`, set the `curated` parameter to `true`.
    *
    * @param curated - whether to return the curated history or the comprehensive
-   * history.
+   *     history.
    * @return History contents alternating between user and model for the entire
-   * chat session.
+   *     chat session.
    */
   getHistory(curated: boolean = false): Content[] {
     const history = curated
@@ -583,7 +572,7 @@ export class GeminiChat {
       if (cyclicSchemaTools.length > 0) {
         const extraDetails =
           `\n\nThis error was probably caused by cyclic schema references in one of the following tools, try disabling them with excludeTools:\n\n - ` +
-          cyclicSchemaTools.join(`\n - `) +
+          cyclicSchemaTools.join(`\n - `) + 
           `\n`;
         error.message += extraDetails;
       }
@@ -596,85 +585,40 @@ export class GeminiChat {
   ): AsyncGenerator<GenerateContentResponse> {
     const modelResponseParts: Part[] = [];
     let hasReceivedAnyChunk = false;
-    let hasToolCall = false;
-    let lastChunk: GenerateContentResponse | null = null;
-
-    let lastChunkIsInvalid = false;
+    let isStreamInvalid = false;
 
     for await (const chunk of streamResponse) {
       hasReceivedAnyChunk = true;
-      lastChunk = chunk;
-
       if (isValidResponse(chunk)) {
-        lastChunkIsInvalid = false;
         const content = chunk.candidates?.[0]?.content;
-        if (content?.parts) {
-          if (content.parts.some((part) => part.thought)) {
-            // Record thoughts
-            this.recordThoughtFromContent(content);
+        if (content) {
+          // Filter out thought parts from being added to history.
+          if (!this.isThoughtContent(content) && content.parts) {
+            modelResponseParts.push(...content.parts);
           }
-          if (content.parts.some((part) => part.functionCall)) {
-            hasToolCall = true;
-          }
-          // Always add parts - thoughts will be filtered out later in recordHistory
-          modelResponseParts.push(...content.parts);
         }
       } else {
         logInvalidChunk(
           this.config,
           new InvalidChunkEvent('Invalid chunk received from stream.'),
         );
-        lastChunkIsInvalid = true;
+        isStreamInvalid = true;
       }
-
-      // Record token usage if this chunk has usageMetadata
-      if (chunk.usageMetadata) {
-        this.chatRecordingService.recordMessageTokens(chunk.usageMetadata);
-      }
-
       yield chunk; // Yield every chunk to the UI immediately.
     }
 
-    if (!hasReceivedAnyChunk) {
-      throw new EmptyStreamError('Model stream completed without any chunks.');
-    }
-
-    const finishReason = lastChunk?.candidates?.[0]?.finishReason;
-    const isSuccessfulFinish =
-      finishReason === 'STOP' || finishReason === 'MAX_TOKENS';
-
-    // --- FIX: The entire validation block was restructured for clarity and correctness ---
-    // Only apply complex validation if an invalid chunk was actually found.
-    if ((lastChunkIsInvalid || !isSuccessfulFinish) && !hasToolCall) {
-      // If the *only* invalid part was the last chunk, we still check its finish reason.
-
+    // Now that the stream is finished, make a decision.
+    // Throw an error if the stream was invalid OR if it was completely empty.
+    if (isStreamInvalid || !hasReceivedAnyChunk) {
       throw new EmptyStreamError(
         'Model stream ended with an invalid chunk and a failed finish reason.',
       );
     }
 
-    // Record model response text from the collected parts
-    if (modelResponseParts.length > 0) {
-      const responseText = modelResponseParts
-        .filter((part) => part.text && !part.thought)
-        .map((part) => part.text)
-        .join('');
-
-      if (responseText.trim()) {
-        this.chatRecordingService.recordMessage({
-          type: 'gemini',
-          content: responseText,
-        });
-      }
-    }
-
-    // Bundle all streamed parts into a single Content object
-    const modelOutput: Content[] =
-      modelResponseParts.length > 0
-        ? [{ role: 'model', parts: modelResponseParts }]
-        : [];
-
-    // Pass the raw, bundled data to the new, robust recordHistory
+    // Use recordHistory to correctly save the conversation turn.
+    const modelOutput: Content[] = [
+      { role: 'model', parts: modelResponseParts },
+    ];
     this.recordHistory(userInput, modelOutput);
   }
 
@@ -683,99 +627,82 @@ export class GeminiChat {
     modelOutput: Content[],
     automaticFunctionCallingHistory?: Content[],
   ) {
-    // Part 1: Handle the user's turn.
+    const newHistoryEntries: Content[] = [];
+
+    // Part 1: Handle the user's part of the turn.
     if (
       automaticFunctionCallingHistory &&
       automaticFunctionCallingHistory.length > 0
     ) {
-      this.history.push(
+      newHistoryEntries.push(
         ...extractCuratedHistory(automaticFunctionCallingHistory),
       );
     } else {
-      if (
-        this.history.length === 0 ||
-        this.history[this.history.length - 1] !== userInput
-      ) {
-        const lastTurn = this.history[this.history.length - 1];
-        // The only time we don't push is if it's the *exact same* object,
-        // which happens in streaming where we add it preemptively.
-        if (lastTurn !== userInput) {
-          if (lastTurn?.role === 'user') {
-            // This is an invalid sequence.
-            throw new Error('Cannot add a user turn after another user turn.');
+      newHistoryEntries.push(userInput);
+    }
+
+    // Part 2: Handle the model's part of the turn, filtering out thoughts.
+    const nonThoughtModelOutput = modelOutput.filter(
+      (content) => !this.isThoughtContent(content),
+    );
+
+    let outputContents: Content[] = [];
+    if (nonThoughtModelOutput.length > 0) {
+      outputContents = nonThoughtModelOutput;
+    } else if (
+      modelOutput.length === 0 &&
+      !isFunctionResponse(userInput) &&
+      !automaticFunctionCallingHistory
+    ) {
+      // Add an empty model response if the model truly returned nothing.
+      outputContents.push({ role: 'model', parts: [] } as Content);
+    }
+
+    // Part 3: Consolidate the parts of this turn's model response.
+    const consolidatedOutputContents: Content[] = [];
+    if (outputContents.length > 0) {
+      for (const content of outputContents) {
+        const lastContent = 
+          consolidatedOutputContents[consolidatedOutputContents.length - 1];
+        if (this.hasTextContent(lastContent) && this.hasTextContent(content)) {
+          lastContent.parts[0].text += content.parts[0].text || '';
+          if (content.parts.length > 1) {
+            lastContent.parts.push(...content.parts.slice(1));
           }
-          this.history.push(userInput);
+        } else {
+          consolidatedOutputContents.push(content);
         }
       }
     }
 
-    // Part 2: Process the model output into a final, consolidated list of turns.
-    const finalModelTurns: Content[] = [];
-    for (const content of modelOutput) {
-      // A. Preserve malformed content that has no 'parts' array.
-      if (!content.parts) {
-        finalModelTurns.push(content);
-        continue;
-      }
+    // Part 4: Add the new turn (user and model parts) to the main history.
+    this.history.push(...newHistoryEntries, ...consolidatedOutputContents);
+  }
 
-      // B. Filter out 'thought' parts.
-      const visibleParts = content.parts.filter((part) => !part.thought);
+  private hasTextContent(
+    content: Content | undefined,
+  ): content is Content & { parts: [{ text: string }, ...Part[]] } {
+    return !!(
+      content &&
+      content.role === 'model' &&
+      content.parts &&
+      content.parts.length > 0 &&
+      typeof content.parts[0].text === 'string' &&
+      content.parts[0].text !== ''
+    );
+  }
 
-      const newTurn = { ...content, parts: visibleParts };
-      const lastTurnInFinal = finalModelTurns[finalModelTurns.length - 1];
-
-      // Consolidate this new turn with the PREVIOUS turn if they are adjacent model turns.
-      if (
-        lastTurnInFinal &&
-        lastTurnInFinal.role === 'model' &&
-        newTurn.role === 'model' &&
-        lastTurnInFinal.parts && // SAFETY CHECK: Ensure the destination has a parts array.
-        newTurn.parts
-      ) {
-        lastTurnInFinal.parts.push(...newTurn.parts);
-      } else {
-        finalModelTurns.push(newTurn);
-      }
-    }
-
-    // Part 3: Add the processed model turns to the history, with one final consolidation pass.
-    if (finalModelTurns.length > 0) {
-      // Re-consolidate parts within any turns that were merged in the previous step.
-      for (const turn of finalModelTurns) {
-        if (turn.parts && turn.parts.length > 1) {
-          const consolidatedParts: Part[] = [];
-          for (const part of turn.parts) {
-            const lastPart = consolidatedParts[consolidatedParts.length - 1];
-            if (
-              lastPart &&
-              // Ensure lastPart is a pure text part
-              typeof lastPart.text === 'string' &&
-              !lastPart.functionCall &&
-              !lastPart.functionResponse &&
-              !lastPart.inlineData &&
-              !lastPart.fileData &&
-              !lastPart.thought &&
-              // Ensure current part is a pure text part
-              typeof part.text === 'string' &&
-              !part.functionCall &&
-              !part.functionResponse &&
-              !part.inlineData &&
-              !part.fileData &&
-              !part.thought
-            ) {
-              lastPart.text += part.text;
-            } else {
-              consolidatedParts.push({ ...part });
-            }
-          }
-          turn.parts = consolidatedParts;
-        }
-      }
-      this.history.push(...finalModelTurns);
-    } else {
-      // If, after all processing, there's NO model output, add the placeholder.
-      this.history.push({ role: 'model', parts: [] });
-    }
+  private isThoughtContent(
+    content: Content | undefined,
+  ): content is Content & { parts: [{ thought: boolean }, ...Part[]] } {
+    return !!(
+      content &&
+      content.role === 'model' &&
+      content.parts &&
+      content.parts.length > 0 &&
+      typeof content.parts[0].thought === 'boolean' &&
+      content.parts[0].thought === true
+    );
   }
 
   /**
@@ -792,7 +719,7 @@ export class GeminiChat {
   recordCompletedToolCalls(toolCalls: CompletedToolCall[]): void {
     const toolCallRecords = toolCalls.map((call) => {
       const resultDisplayRaw = call.response?.resultDisplay;
-      const resultDisplay =
+      const resultDisplay = 
         typeof resultDisplayRaw === 'string' ? resultDisplayRaw : undefined;
 
       return {
@@ -840,6 +767,6 @@ export function isSchemaDepthError(errorMessage: string): boolean {
   return errorMessage.includes('maximum schema depth exceeded');
 }
 
-export function isInvalidArgumentError(errorMessage: string): boolean {
+export function isInvalidArgumentError(errorMessage:string): boolean {
   return errorMessage.includes('Request contains an invalid argument');
 }
