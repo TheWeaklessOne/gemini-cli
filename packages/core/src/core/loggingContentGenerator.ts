@@ -166,7 +166,12 @@ export class LoggingContentGenerator implements ContentGenerator {
       }
     } catch (error) {
       const durationMs = Date.now() - startTime;
-      this._logApiError(durationMs, error, responses[0]?.modelVersion || '', userPromptId);
+      this._logApiError(
+        durationMs,
+        error,
+        responses[0]?.modelVersion || '',
+        userPromptId,
+      );
       throw error;
     }
     const durationMs = Date.now() - startTime;
