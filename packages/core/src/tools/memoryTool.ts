@@ -47,7 +47,7 @@ Saves a specific piece of information or fact to your long-term memory.
 Use this tool:
 
 - When the user explicitly asks you to remember something (e.g., "Remember that I like pineapple on pizza", "Please save this: my cat's name is Whiskers").
-- When the user states a clear, concise fact about themselves, their preferences, or their environment that seems important for you to retain for future interactions to provide a more personalized and effective assistance.
+- When the user states a clear, concise fact about themselves, their preferences, or their environment that seems important to retain for future interactions to provide a more personalized and effective assistance.
 
 Do NOT use this tool:
 
@@ -60,7 +60,6 @@ Do NOT use this tool:
 - \`fact\` (string, required): The specific fact or piece of information to remember. This should be a clear, self-contained statement. For example, if the user says "My favorite color is blue", the fact would be "My favorite color is blue".
 `;
 
-export const GEMINI_CONFIG_DIR = '.gemini';
 export const DEFAULT_CONTEXT_FILENAME = 'GEMINI.md';
 export const MEMORY_SECTION_HEADER = '## Gemini Added Memories';
 
