@@ -735,31 +735,6 @@ export class GeminiChat {
 
     this.chatRecordingService.recordToolCalls(toolCallRecords);
   }
-
-  /**
-   * Extracts and records thought from thought content.
-   */
-  private recordThoughtFromContent(content: Content): void {
-    if (!content.parts || content.parts.length === 0) {
-      return;
-    }
-
-    const thoughtPart = content.parts[0];
-    if (thoughtPart.text) {
-      // Extract subject and description using the same logic as turn.ts
-      const rawText = thoughtPart.text;
-      const subjectStringMatches = rawText.match(/\*\*(.*?)\*\*/s);
-      const subject = subjectStringMatches
-        ? subjectStringMatches[1].trim()
-        : '';
-      const description = rawText.replace(/\*\*(.*?)\*\*/s, '').trim();
-
-      this.chatRecordingService.recordThought({
-        subject,
-        description,
-      });
-    }
-  }
 }
 
 /** Visible for Testing */
